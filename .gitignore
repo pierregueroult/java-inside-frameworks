@@ -1,0 +1,33 @@
+# Build Maven et autres sorties générées
+/target/
+/build/
+*.class
+*.log
+
+# Configurations locales des IDE
+.idea/
+.vscode/
+*.iml
+*.iws
+*.ipr
+.classpath
+.project
+.settings/
+.factorypath
+.apt_generated/
+.kotlin/
+
+# Configuration et secrets locaux
+.env
+.env.*
+!.env.example
+.aws/
+*.pem
+*.key
+
+# Fichiers du système et de l'éditeur
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
