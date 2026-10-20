@@ -49,6 +49,24 @@ public final class EventBus {
   // Q2 : état propre à chaque bus, contrairement aux métadonnées statiques de Q8.
   private final List<Registration> registrations = new ArrayList<>();
 
+  /*
+   * RAPPEL DE COURS — Q8 : ClassValue et durée de vie des métadonnées
+   * ClassValue<V> associe une valeur V à chaque Class<?> consultée. get(type)
+   * renvoie la valeur associée ou déclenche computeValue(type) si elle manque.
+   * Ici : Class<?> -> liste des Method validées, partagée entre tous les bus.
+   * Une exception dans computeValue n'est pas mise en cache : un get ultérieur
+   * peut retenter le calcul. remove(type) permet de demander un recalcul.
+   * Aucune invalidation n'est nécessaire ici : inscrire/fermer un abonné ne
+   * change pas les méthodes déclarées dans sa classe.
+   * Un champ static appartient à la classe EventBus ; un champ d'instance
+   * comme registrations appartient à chaque objet EventBus.
+   * Le cache ne doit jamais capturer un listener : ce serait mélanger les
+   * métadonnées partagées avec l'état d'une inscription et retenir des objets.
+   * Une HashMap<Class<?>, V> statique conserve fortement ses clés. ClassValue
+   * est conçu pour associer des métadonnées sans empêcher le déchargement
+   * des classes devenues inutilisées. Les valeurs partagées doivent rester
+   * non modifiables pour qu'un utilisateur ne corrompe pas le cache commun.
+   */
   // Q8 : seule la classe détermine ses méthodes, jamais l'instance abonnée.
   // ClassValue permet le déchargement des classes, contrairement à une map
   // statique ordinaire gardant ses clés Class en références fortes.
@@ -75,10 +93,45 @@ public final class EventBus {
   // Son paramètre réfléchi ne suffit donc pas à retrouver E.
   private static final Method LISTENER_METHOD = listenerMethod();
 
+  /*
+   * RAPPEL DE COURS — Q9 : ThreadLocal, portée dynamique et finally
+   * ThreadLocal<T> fournit une case T PAR THREAD : get lit sa case, set la
+   * remplace, remove la retire. Un ThreadLocal ordinaire ne transmet pas sa
+   * valeur à un autre thread. static ne signifie donc pas « une seule valeur
+   * pour tous les threads » : seul l'objet ThreadLocal est partagé.
+   * Le contexte est accessible pendant un appel sans être transmis à toutes
+   * les méthodes : c'est une portée dynamique, liée à la pile d'appels.
+   * Pattern : lire l'ancien contexte -> installer le nouveau -> try/finally.
+   * Dans finally : restaurer l'ancien contexte si l'appel est imbriqué ;
+   * sinon remove, pour libérer les références au bus et à l'événement.
+   * finally s'exécute lors d'un retour ou d'une exception Java, contrairement
+   * à une instruction simplement placée après le try.
+   * Cela évite aussi qu'un thread réutilisé par un pool garde un ancien contexte.
+   * ThreadLocal n'est ni un verrou ni un moyen de rendre ArrayList thread-safe.
+   */
   // Q9 : un contexte différent pour chaque thread, partagé entre les bus de ce thread.
   // Le contexte doit être retiré/restauré à la fin de CHAQUE publication.
   private static final ThreadLocal<DispatchContext> CURRENT_DISPATCH = new ThreadLocal<>();
 
+  /*
+   * RAPPEL DE COURS — Q1 : Class, Method, annotations et comparateurs
+   * Un objet est une instance ; sa Class décrit son type à l'exécution.
+   * String.class et "abc".getClass() désignent ainsi la même Class.
+   * Class<?> décrit une classe dont on ne connaît pas ici le paramètre générique.
+   * getMethods() : méthodes publiques, héritées comprises, sans ordre garanti.
+   * getDeclaredMethods() : méthodes déclarées dans cette classe, même privées,
+   * mais pas les méthodes uniquement héritées. Les découvrir n'autorise pas
+   * pour autant à les appeler : les règles d'accès de Java restent applicables.
+   * Une Method décrit un nom, des paramètres, un retour et des modificateurs.
+   * getParameterTypes() renvoie des Class, pas les valeurs passées à l'appel.
+   * void.class est le type de retour « aucun résultat » ; Void.class est une
+   * classe de référence différente. int.class est primitif, Integer.class non.
+   * isAnnotationPresent(A.class) teste une annotation disponible à l'exécution.
+   * getAnnotation(A.class) renvoie son instance ou null ; getAnnotations()
+   * renvoie les annotations visibles sur cet élément.
+   * comparing extrait le premier critère ; thenComparing ne départage que les
+   * égalités. Ici on trie par nom de méthode, puis nom du type du paramètre.
+   */
   // Q1 : getMethods() inclut les méthodes publiques héritées.
   // Les méthodes statiques/non annotées sont ignorées AVANT la validation.
   static List<Method> subscriberMethods(Class<?> type) {
@@ -106,6 +159,45 @@ public final class EventBus {
     return method;
   }
 
+  /*
+   * RAPPEL DE COURS — Q2/Q3 : appeler par réflexion et distinguer les erreurs
+   * method.invoke(receiver, args...) exécute une méthode sur receiver et renvoie
+   * Object. Un résultat primitif est boxé ; un retour void est représenté par null.
+   * InvocationTargetException signifie que la méthode appelée a lancé un
+   * Throwable : getCause() permet de récupérer l'objet original. Cela vaut
+   * pour les exceptions vérifiées, RuntimeException et Error de l'abonné.
+   * IllegalAccessException signale au contraire un problème d'accès réfléchi.
+   * IllegalArgumentException peut signaler un mauvais receiver ou argument ;
+   * notre validation et notre filtrage doivent éviter cette erreur de programmation.
+   * Throwable est la racine : Exception comprend les exceptions vérifiées et
+   * RuntimeException ; Error est une autre branche. Un catch(Exception) seul
+   * ne capture donc pas directement une Error.
+   * Ici on collecte les causes des InvocationTargetException pour continuer
+   * les autres appels. On ne transforme pas les erreurs du framework en échecs
+   * d'abonné : le companion convertit l'accès interdit en IllegalAccessError.
+   *
+   * RAPPEL DE COURS — Q4 : égalité de types et compatibilité
+   * type == event.getClass() impose exactement le même type.
+   * type.isInstance(event) accepte aussi les sous-types : CharSequence accepte String.
+   * Pour un event non nul, type.isAssignableFrom(event.getClass()) est équivalent.
+   * Le sens est « le type de GAUCHE accepte le type de DROITE », pas l'inverse.
+   * isInstance(null) vaut false ; event.getClass() sur null provoque une NPE.
+   * Un switch avec case String ne sait tester qu'un type écrit dans le code,
+   * contrairement au type découvert dynamiquement pour chaque abonné.
+   *
+   * RAPPEL DE COURS — Q6 : streams, tri stable et instantané
+   * filter garde des éléments ; map transforme un élément en un autre ; flatMap
+   * transforme chaque élément en un stream puis réunit ces streams en un seul.
+   * Ces opérations intermédiaires sont paresseuses : une opération terminale
+   * comme toList déclenche le parcours. Stream.toList renvoie une liste non modifiable.
+   * Un stream conserve ici l'ordre des List sources. sorted est stable sur
+   * un stream ordonné : les priorités égales conservent l'ordre d'inscription,
+   * puis l'ordre des méthodes établi en Q1.
+   * comparingInt compare des int sans boxing ; reversed inverse l'ordre.
+   * Ne pas soustraire deux priorités : le calcul peut déborder aux valeurs extrêmes.
+   * Construire calls avant toute invocation fixe les destinataires de CET appel.
+   * Les changements d'inscriptions pendant l'exécution affectent les posts suivants.
+   */
   /** Q2 à Q6 : préparer les appels, puis exécuter en isolant les échecs. Q9 : borner le contexte. */
   public DispatchReport post(Object event) {
     Objects.requireNonNull(event);
@@ -169,6 +261,14 @@ public final class EventBus {
     return context;
   }
 
+  /*
+   * RAPPEL DE COURS — Q2 : valider avant de modifier l'état
+   * Une inscription comprend un objet ET les méthodes à appeler sur lui.
+   * Une Method peut être partagée entre instances ; son receiver doit rester
+   * propre à chaque inscription. Terminer les validations avant registrations.add
+   * évite une inscription partielle si une méthode est invalide.
+   * Ce principe d'atomicité fonctionnelle ne constitue pas une garantie de concurrence.
+   */
   /** Q2, Q5, Q8 : valider, inscrire et renvoyer une fermeture propre à cette inscription. */
   public Subscription register(Object listener) {
     Objects.requireNonNull(listener);
@@ -178,6 +278,19 @@ public final class EventBus {
     return addRegistration(registration);
   }
 
+  /*
+   * RAPPEL DE COURS — Q5 : interface fonctionnelle, capture et identité
+   * Une interface fonctionnelle possède une seule méthode abstraite : une lambda
+   * fournit son implantation. Ici () -> ... fournit Subscription.close().
+   * Une lambda capture les variables locales finales ou effectivement finales
+   * (jamais réaffectées). Elle capture la référence, pas une copie de l'objet.
+   * == compare l'identité des objets ; equals compare selon leur contrat.
+   * Deux records Registration ayant les mêmes composants peuvent être égaux
+   * sans être la même inscription. removeIf avec == retire exactement la bonne.
+   * Idempotent signifie qu'un second close a le même effet final que le premier.
+   * Attention : une lambda sans capture comme () -> {} peut être réutilisée
+   * par la JVM ; sa création ne garantit pas une nouvelle identité à chaque appel.
+   */
   // Q5, Q12 : le même mécanisme gère aussi les abonnements génériques.
   private Subscription addRegistration(Registration registration) {
     registrations.add(registration);
@@ -187,6 +300,24 @@ public final class EventBus {
     return () -> registrations.removeIf(current -> current == registration);
   }
 
+  /*
+   * RAPPEL DE COURS — Q10 : Constructor et règles d'accès
+   * getConstructor(types...) cherche un constructeur PUBLIC dont les paramètres
+   * correspondent exactement aux Class fournies. Sans argument : constructeur vide.
+   * getDeclaredConstructor inclut les constructeurs non publics mais ne rend pas
+   * ces constructeurs accessibles. Nous n'utilisons pas setAccessible.
+   * Un constructeur public d'une classe inaccessible peut rester non invocable.
+   * Constructor<T>.newInstance(args...) crée une instance et renvoie T ; avec
+   * Constructor<?> le type concret est inconnu, mais le résultat est utilisable en Object.
+   * Absence de constructeur -> NoSuchMethodException à la recherche.
+   * Classe abstraite -> InstantiationException à l'instanciation.
+   * Accès interdit -> IllegalAccessException.
+   * Exception du corps du constructeur -> InvocationTargetException et sa cause.
+   * La conversion en NoSuchMethodError/InstantiationError/IllegalAccessError
+   * est la convention choisie dans le companion, pas une obligation du langage.
+   * initCause conserve l'exception technique originale pour le diagnostic.
+   * Une construction réussie ne doit avoir lieu qu'une fois PAR inscription.
+   */
   /** Q10 : construire un nouvel abonné pour cet appel, puis réutiliser register(Object). */
   public Subscription registerClass(Class<?> listenerType) {
     Objects.requireNonNull(listenerType);
@@ -224,6 +355,24 @@ public final class EventBus {
     }
   }
 
+  /*
+   * RAPPEL DE COURS — Q11 : introspection d'un record
+   * Déclarer un record et analyser sa structure par réflexion sont deux notions.
+   * Class.isRecord() distingue les records des classes ordinaires.
+   * getRecordComponents() donne leurs composants dans l'ordre de déclaration ;
+   * cette méthode renvoie null si la classe n'est pas un record.
+   * Un RecordComponent donne getName(), getType() et getAccessor() (une Method).
+   * Pour record Point(int x, int y), les accesseurs sont x() et y(), pas getX/getY.
+   * Un accesseur explicite peut calculer sa valeur ou lever une exception : lire
+   * directement le champ ne respecterait pas ce comportement.
+   * invoquer x() via Method.invoke renvoie un Integer, par boxing du résultat int.
+   * Le constructeur canonique prend les composants dans ce même ordre ; le
+   * retrouver serait possible avec leurs getType(), mais Q11 ne construit rien.
+   * Collectors.joining séparateur/préfixe/suffixe assemble les chaînes du stream.
+   * String.valueOf(Object) gère null et utilise le toString de la valeur sinon.
+   * Ici on n'appelle pas le toString du record externe ; les valeurs composantes
+   * sont formatées normalement, sans sérialisation récursive ni copie des objets.
+   */
   /**
    * Q11 : texte d'une entrée de journal, sans appeler le toString du record lui-même.
    * Exemple : describeEvent(new OrderCreated(42, 19.5)) -> OrderCreated[id=42, amount=19.5].
@@ -250,6 +399,17 @@ public final class EventBus {
     }
   }
 
+  /*
+   * RAPPEL DE COURS — Q10/Q11 : propager une cause et pattern switch
+   * Un pattern case RuntimeException exception teste le type et introduit une
+   * variable déjà typée, sans cast manuel. Le switch expression produit une valeur.
+   * Le cas Error lance directement l'erreur ; les autres cas produisent une
+   * RuntimeException que l'appelant lance avec throw uncheckedCause(...).
+   * UndeclaredThrowableException permet d'envelopper une exception vérifiée
+   * dans une exception non vérifiée en conservant sa cause.
+   * Cette politique diffère de Q3 : post collecte les échecs, alors que la
+   * construction ou la description échoue en propageant la cause.
+   */
   // Q10, Q11 : un switch sur les types connus d'exceptions est approprié ici.
   // Contrairement au type dynamique du paramètre abonné (Q4), ces cas sont fixes.
   private static RuntimeException uncheckedCause(Throwable cause) {
@@ -260,6 +420,42 @@ public final class EventBus {
     };
   }
 
+  /*
+   * RAPPEL DE COURS — Q12 : Type, ParameterizedType et effacement
+   * Class décrit une classe à l'exécution. Type est plus général et représente
+   * aussi les signatures génériques enregistrées dans le fichier .class.
+   * Pour class Audit implements Listener<String> :
+   *   getInterfaces()        -> la Class brute Listener.class ;
+   *   getGenericInterfaces() -> un Type décrivant Listener<String> ;
+   *   getRawType()           -> Listener.class sur ce ParameterizedType ;
+   *   getActualTypeArguments()[0] -> String.class.
+   *
+   * Les principales formes de Type à connaître dans le companion :
+   * - Class : String, CharSequence ou un tableau concret comme String[].
+   * - ParameterizedType : List<String>, Listener<String>, etc.
+   * - TypeVariable : T dans class Generic<T> implements Listener<T>.
+   * - GenericArrayType : T[] quand le composant n'est pas une Class concrète.
+   * - WildcardType : ? extends Number ou ? super Integer dans une signature.
+   * Ne pas caster arbitrairement un Type en Class : tester sa forme auparavant.
+   * Le motif argument instanceof Class<?> eventType fait ce test et ce cast.
+   *
+   * Effacement : E n'a pas de borne explicite, donc onEvent(E) devient
+   * onEvent(Object) dans la signature JVM de l'interface. Le compilateur peut
+   * générer une méthode pont (bridge) pour déléguer vers onEvent(String).
+   * La Class de l'instance ne révèle pas toute instanciation générique :
+   * new Generic<String>() et new Generic<Integer>() ont la même classe Generic.
+   * À l'inverse, new Listener<String>() { ... } déclare une classe anonyme dont
+   * la signature générique conserve ici String. Une lambda n'offre pas cette
+   * signature d'implémentation exploitable par notre résolution.
+   *
+   * Listener<?> signifie « type d'événement inconnu », pas Listener<Object>.
+   * On ne peut donc pas appeler librement listener.onEvent(event) en Java typé.
+   * Nous résolvons E, vérifions sa compatibilité, puis invoquons la méthode
+   * publique effacée de Listener par réflexion.
+   * Le TP ne résout que les implémentations DIRECTES avec E représenté par une
+   * Class. Remonter une hiérarchie générique complète demanderait de substituer
+   * les variables de type à chaque niveau : c'est explicitement hors périmètre.
+   */
   /**
    * Q12 : pas d'annotation requise. Le type E est lu sur la classe de l'objet.
    * Exemple : class Audit implements Listener<OrderCreated> { ... }
@@ -305,6 +501,26 @@ public final class EventBus {
     void onEvent(E event) throws Throwable;
   }
 
+  /*
+   * RAPPEL DE COURS — Q7 : proxies dynamiques et méthode générique
+   * Proxy.newProxyInstance charge une classe générée qui implémente les interfaces
+   * demandées. Il faut leur ClassLoader, un tableau de Class d'interfaces et un handler.
+   * Chaque appel passe par InvocationHandler.invoke(proxy, method, args) :
+   * proxy = l'objet généré ; method = la méthode d'interface ; args = ses arguments.
+   * args peut être null pour une méthode sans argument, notamment celles d'Object.
+   * equals/hashCode/toString sont aussi redirigées : les traiter avant args[0].
+   * Ici les autres méthodes ont déjà été validées avec exactement un paramètre.
+   * Ne pas appeler method.invoke(proxy, args) dans le handler : cela rappelle
+   * le même proxy et provoquerait une récursion sans fin.
+   * Le handler capture this et appelle son post : il voit donc l'état ACTUEL du bus.
+   *
+   * <E> E createEmitter(Class<E> type) relie le paramètre et le résultat :
+   * passer Orders.class permet au compilateur de déduire le retour Orders.
+   * Class.cast vérifie le cast à l'exécution et évite un cast générique non contrôlé.
+   * Proxy.isProxyClass(obj.getClass()) permet de reconnaître un proxy JDK ;
+   * Proxy.getInvocationHandler(obj) permet ensuite de récupérer son handler.
+   * Cette inspection n'est pas nécessaire pour implémenter notre émetteur.
+   */
   /** Q7 : E lie le type de la Class reçue au type renvoyé ; aucun cast côté utilisateur. */
   public <E> E createEmitter(Class<E> interfaceType) {
     Objects.requireNonNull(interfaceType);
@@ -346,6 +562,17 @@ public final class EventBus {
     void close();
   }
 
+  /*
+   * RAPPEL DE COURS — Q1 : déclaration et méta-annotations
+   * @interface déclare une annotation, pas une classe à instancier avec new.
+   * Ses attributs sont des méthodes sans argument ; default fournit une valeur
+   * lorsqu'on ne précise pas cet attribut à l'utilisation de l'annotation.
+   * @Retention précise sa conservation : SOURCE, CLASS (valeur par défaut)
+   * ou RUNTIME. Sans RUNTIME, notre réflexion ne peut pas la lire.
+   * @Target limite les éléments autorisés : METHOD ici, TYPE pour une classe,
+   * CONSTRUCTOR pour un constructeur, RECORD_COMPONENT pour un composant, etc.
+   * Retention et Target sont elles-mêmes des annotations : des méta-annotations.
+   */
   // Q1 : RUNTIME rend l'annotation consultable par réflexion ; METHOD limite sa cible.
   // Un attribut d'annotation est une méthode sans paramètre avec éventuellement un default.
   @Retention(RetentionPolicy.RUNTIME)
@@ -374,6 +601,21 @@ public final class EventBus {
     }
   }
 
+  /*
+   * RAPPEL DE COURS — Q2/Q3 : records, constructeur compact et immuabilité
+   * Un record génère des champs privés finaux, les accesseurs portant les noms
+   * des composants, le constructeur canonique, equals, hashCode et toString.
+   * Son equals compare les composants : l'identité de l'objet reste une autre notion.
+   * Un constructeur compact n'écrit pas la liste des paramètres. Il peut valider
+   * ou réaffecter ces paramètres avant leur affectation automatique aux champs.
+   * Ainsi failures = List.copyOf(failures) change la liste réellement conservée.
+   * Un champ final interdit sa réaffectation, pas la mutation de l'objet référencé.
+   * List.copyOf protège de la mutation ultérieure de la liste fournie et refuse
+   * les éléments null. Elle peut réutiliser une liste déjà adaptée : aucune
+   * nouvelle identité de liste n'est garantie. Ses éléments ne sont pas clonés.
+   * Collections.unmodifiableList crée au contraire une vue non modifiable dont
+   * le contenu peut encore changer si la liste source est modifiée ailleurs.
+   */
   // Q3 : le constructeur compact valide/transforme les paramètres avant l'affectation.
   // List.copyOf refuse null et crée un instantané non modifiable ; les éléments
   // (dont les Throwable) ne sont pas clonés : l'immuabilité n'est pas profonde.
